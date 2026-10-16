@@ -101,6 +101,37 @@ configurable per contract via `upgrade_fn`.
 
 ---
 
+## Install
+
+### Container image
+
+Each release publishes a multi-arch image (linux/amd64, linux/arm64) to GitHub
+Container Registry, built from the same commit and binary as the release
+archives:
+
+```bash
+docker pull ghcr.io/soroworks/soroforge:latest      # or a version, e.g. :0.3.0
+docker run --rm ghcr.io/soroworks/soroforge:latest version
+```
+
+Run the HTTP API from your project directory. Inside a container the server must
+listen on all interfaces, so set `SOROFORGE_API_ADDR` explicitly and publish the
+port only where you need it:
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -v "$PWD:/work" -w /work \
+  -e DATABASE_URL -e SOROFORGE_SECRET_KEY -e SOROFORGE_API_TOKEN \
+  -e SOROFORGE_API_ADDR=0.0.0.0:8080 \
+  ghcr.io/soroworks/soroforge:latest serve
+```
+
+The image runs as a non-root user and contains no secrets; pass them through the
+environment or mount a keystore file (`SOROFORGE_KEYSTORE_PATH`). Pin a version
+tag in Kubernetes or Compose rather than `:latest`.
+
+---
+
 ## Quickstart — deploy to testnet
 
 **Prerequisites:** Go 1.25+, Docker (for Postgres), a compiled contract `.wasm`,
