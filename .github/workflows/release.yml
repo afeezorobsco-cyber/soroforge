@@ -9,6 +9,10 @@ permissions:
   # Push the release image to ghcr.io with the built-in GITHUB_TOKEN; no
   # long-lived registry credentials.
   packages: write
+  # Build-provenance attestations: a Sigstore certificate bound to this
+  # workflow run (id-token), stored with the repository's attestations.
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -60,6 +64,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GoReleaser shells out to Syft for the per-archive SBOMs.
+      - uses: anchore/sbom-action/download-syft@v0
+
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
@@ -67,3 +74,18 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Link every release file to this workflow run, so users can check with
+      # `gh attestation verify` that it was built here from the tagged commit.
+      # checksums.txt lists the archives and their SBOMs.
+      - name: Attest release archives and SBOMs
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: ./dist/checksums.txt
+
+      # The bare binaries too, so a binary already extracted from its archive
+      # can still be verified.
+      - name: Attest binaries
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "./dist/soroforge_*/soroforge*"
