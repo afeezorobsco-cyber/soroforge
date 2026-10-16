@@ -101,6 +101,32 @@ configurable per contract via `upgrade_fn`.
 
 ---
 
+## Install
+
+### Release binaries
+
+Download the archive for your platform from the
+[latest release](https://github.com/soroworks/soroforge/releases/latest).
+Each archive ships with an SPDX SBOM (`<archive>.sbom.json`) listing what went
+into it, and every archive, SBOM and binary carries a GitHub build-provenance
+attestation tying it to the release workflow run and commit that built it.
+
+SoroForge holds deployer keys, so verify what you run before you run it, using
+the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify soroforge_<version>_linux_amd64.tar.gz -R soroworks/soroforge
+
+# The extracted binary verifies the same way:
+tar xzf soroforge_<version>_linux_amd64.tar.gz
+gh attestation verify soroforge -R soroworks/soroforge
+```
+
+`checksums.txt` in the release still lists SHA-256 sums for every archive and
+SBOM.
+
+---
+
 ## Quickstart — deploy to testnet
 
 **Prerequisites:** Go 1.25+, Docker (for Postgres), a compiled contract `.wasm`,
