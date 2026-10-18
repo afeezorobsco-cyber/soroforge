@@ -72,6 +72,12 @@ func TestPostgresStore(t *testing.T) {
 	runStoreSuite(t, newPostgresStore)
 }
 
+func TestPostgresHistory(t *testing.T) {
+	// Export/import losslessness must hold against the production backend
+	// too, not just the in-memory and SQLite ones.
+	runHistorySuite(t, newPostgresStore)
+}
+
 func TestPostgresMigrationsAreReversible(t *testing.T) {
 	url := testDatabaseURL(t)
 
@@ -84,7 +90,9 @@ func TestPostgresMigrationsAreReversible(t *testing.T) {
 	version, dirty, err := migrator.Version()
 	require.NoError(t, err)
 	require.False(t, dirty, "migrations must not leave the database dirty")
-	require.Equal(t, uint(2), version)
+	// Bump this alongside every new migration: it is what catches a migration
+	// file that is present but never applied.
+	require.Equal(t, uint(5), version)
 
 	// The suite that runs first leaves rows behind, and reverting 000002
 	// narrows the action constraint — with an 'upload' row present the ADD

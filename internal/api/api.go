@@ -14,6 +14,7 @@ package api
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,8 +40,9 @@ type Service interface {
 	Upgrade(ctx context.Context, req deploy.UpgradeRequest) (*deploy.UpgradeResult, error)
 	Status(ctx context.Context, req deploy.StatusRequest) (*deploy.StatusResult, error)
 	StatusAll(ctx context.Context, network string) (*deploy.NetworkStatus, error)
-	List(ctx context.Context, network string) ([]store.Contract, error)
-	History(ctx context.Context, network, alias string) ([]store.Deployment, error)
+	ListPage(ctx context.Context, network string, limit, offset int) ([]store.Contract, error)
+	HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]store.Deployment, error)
+	GetDeployment(ctx context.Context, id int64) (store.Deployment, error)
 }
 
 // Readiness reports whether SoroForge's dependencies are usable. It backs
@@ -52,6 +54,9 @@ type Service interface {
 type Readiness interface {
 	Check(ctx context.Context) readiness.Status
 }
+
+//go:embed openapi.json
+var openAPIDocument []byte
 
 // requestTimeout bounds a single API request.
 //
@@ -83,6 +88,10 @@ type Options struct {
 
 	// Log defaults to slog.Default().
 	Log *slog.Logger
+
+	// JobRetention is how long finished async jobs stay fetchable. Defaults to
+	// DefaultJobRetention; tests shorten it.
+	JobRetention time.Duration
 }
 
 // route is one endpoint, the scope a token must hold to call it, and its
@@ -109,14 +118,19 @@ func (h *handlers) routes() []route {
 	return []route{
 		{http.MethodGet, "/health", ScopePublic, h.health},
 		{http.MethodGet, "/ready", ScopePublic, h.ready},
+		{http.MethodGet, "/openapi.json", ScopePublic, h.openapi},
 
 		{http.MethodPost, "/v1/deploy", ScopeWrite, h.deploy},
 		{http.MethodPost, "/v1/upgrade", ScopeWrite, h.upgrade},
+
+		{http.MethodGet, "/v1/jobs/{id}", ScopeRead, h.job},
 
 		{http.MethodGet, "/v1/contracts", ScopeRead, h.listContracts},
 		{http.MethodGet, "/v1/contracts/{network}/{alias}/history", ScopeRead, h.history},
 		{http.MethodGet, "/v1/contracts/{network}/{alias}/status", ScopeRead, h.status},
 		{http.MethodGet, "/v1/contracts/{network}/status", ScopeRead, h.statusAll},
+
+		{http.MethodGet, "/v1/deployments/{id}", ScopeRead, h.getDeployment},
 	}
 }
 
@@ -141,7 +155,12 @@ func NewRouter(opts Options) (http.Handler, error) {
 		log = slog.Default()
 	}
 
-	h := &handlers{svc: opts.Service, readiness: opts.Readiness, log: log}
+	h := &handlers{
+		svc:       opts.Service,
+		readiness: opts.Readiness,
+		log:       log,
+		jobs:      newJobManager(opts.JobRetention, log),
+	}
 	auth := &authenticator{tokens: opts.Tokens}
 
 	r := chi.NewRouter()
@@ -237,6 +256,7 @@ type handlers struct {
 	svc       Service
 	readiness Readiness
 	log       *slog.Logger
+	jobs      *jobManager
 }
 
 // errorResponse is the body returned for every failure, so clients can parse

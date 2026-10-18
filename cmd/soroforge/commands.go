@@ -15,6 +15,7 @@ import (
 	"github.com/soroworks/soroforge/internal/api"
 	"github.com/soroworks/soroforge/internal/config"
 	"github.com/soroworks/soroforge/internal/deploy"
+	"github.com/soroworks/soroforge/internal/netcheck"
 	"github.com/soroworks/soroforge/internal/readiness"
 	"github.com/soroworks/soroforge/internal/store"
 	"github.com/spf13/cobra"
@@ -25,8 +26,14 @@ var version = "dev"
 
 func newDeployCmd() *cobra.Command {
 	var (
-		dryRun bool
-		notes  string
+		dryRun      bool
+		notes       string
+		gitCommit   string
+		requireSpec bool
+		all         bool
+		argFlags    []string
+		argsFile    string
+		progress    bool
 	)
 
 	cmd := &cobra.Command{
@@ -39,27 +46,94 @@ its hash, then a contract instance is created from that hash. Both must confirm
 before anything is recorded.
 
 Use --dry-run to assemble and simulate the transactions without submitting
-them. A dry run prints the contract address a real deploy would produce and the
-assembled envelopes, and writes nothing to the database.`,
-		Args: cobra.ExactArgs(1),
+them. A dry run prints the contract address a real deploy would produce, the
+estimated fees, and the assembled envelopes, and writes nothing to the
+database.
+
+A WASM without a contractspecv0 section still deploys, but warns that SoroVault
+cannot catalogue it and clients cannot be generated for it. --require-spec turns
+that warning into an error.
+
+Constructor arguments come from soroforge.yaml unless overridden here for one
+deploy: --arg TYPE:VALUE (repeatable) replaces them, or --args-file points at
+a JSON array of the same typed arguments. The two are mutually exclusive.
+
+With --all, every contract in soroforge.yaml that is not yet tracked on the
+network is deployed, in alias order; already-tracked contracts are skipped.
+The first failure stops the run and the summary reports what was done before
+it. --dry-run works with --all.
+
+Progress is written to stderr while waiting for confirmation, and only when
+stderr is a terminal, so stdout and --json stay clean. Use --progress to force
+it on in a pipe or log.`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if all {
+				return cobra.NoArgs(cmd, args)
+			}
+			return cobra.ExactArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// A dry run writes nothing, so it does not need Postgres — that
+			// A dry run writes nothing, so it does not need a database — that
 			// makes it usable as a config check in a fresh checkout.
 			a, err := newApp(cmd.Context(), appOptions{
 				requireSigner: true,
 				storeOptional: dryRun,
+				progress:      progressFor(progress),
 			})
 			if err != nil {
 				return err
 			}
 			defer a.Close()
 
-			result, err := a.service.Deploy(cmd.Context(), deploy.DeployRequest{
-				Alias:   args[0],
-				Network: flags.network,
-				Notes:   notes,
-				DryRun:  dryRun,
-			})
+			if all {
+				if cmd.Flags().Changed("arg") || cmd.Flags().Changed("args-file") {
+					return fmt.Errorf(
+						"--arg and --args-file are per-contract and cannot be combined with --all")
+				}
+				results, runErr := a.service.DeployAll(cmd.Context(), deploy.DeployAllRequest{
+					Network: flags.network,
+					Notes:   notes,
+					DryRun:  dryRun,
+				})
+				if results != nil {
+					if err := printDeployAll(results); err != nil {
+						return err
+					}
+				}
+				return runErr
+			}
+
+			request := deploy.DeployRequest{
+				Alias:       args[0],
+				Network:     flags.network,
+				Notes:       notes,
+				DryRun:      dryRun,
+				GitCommit:   gitCommit,
+				RequireSpec: requireSpec,
+			}
+
+			switch {
+			case cmd.Flags().Changed("arg") && cmd.Flags().Changed("args-file"):
+				return fmt.Errorf("--arg and --args-file are mutually exclusive; use one or the other")
+			case cmd.Flags().Changed("args-file"):
+				parsed, err := config.ParseArgsFile(argsFile)
+				if err != nil {
+					return err
+				}
+				request.ConstructorArgs = parsed
+			case cmd.Flags().Changed("arg"):
+				parsed := make([]config.Arg, 0, len(argFlags))
+				for _, raw := range argFlags {
+					arg, err := config.ParseArgFlag(raw)
+					if err != nil {
+						return fmt.Errorf("--arg %s: %w", raw, err)
+					}
+					parsed = append(parsed, arg)
+				}
+				request.ConstructorArgs = parsed
+			}
+
+			result, err := a.service.Deploy(cmd.Context(), request)
 			if err != nil {
 				return err
 			}
@@ -71,14 +145,30 @@ assembled envelopes, and writes nothing to the database.`,
 		"assemble and simulate without submitting or recording anything")
 	cmd.Flags().StringVar(&notes, "notes", "",
 		"free-form note recorded with this deployment (e.g. a ticket or release tag)")
+	cmd.Flags().BoolVar(&all, "all", false,
+		"deploy every configured contract that is not yet tracked on the network")
+	cmd.Flags().StringArrayVar(&argFlags, "arg", nil,
+		"constructor argument as TYPE:VALUE (repeatable); replaces the config's constructor_args")
+	cmd.Flags().StringVar(&argsFile, "args-file", "",
+		"JSON file with an array of {type, value} constructor arguments; replaces the config's")
+	cmd.Flags().BoolVar(&progress, "progress", false,
+		"show progress on stderr even when stderr is not a terminal")
+	attachAliasCompletion(cmd)
+	cmd.Flags().StringVar(&gitCommit, "git-commit", "", "override the detected source commit")
+	cmd.Flags().BoolVar(&requireSpec, "require-spec", false,
+		"fail instead of warning when the WASM exports no contractspecv0 section")
 
 	return cmd
 }
 
 func newUpgradeCmd() *cobra.Command {
 	var (
-		dryRun bool
-		notes  string
+		dryRun      bool
+		notes       string
+		gitCommit   string
+		wasmHash    string
+		requireSpec bool
+		progress    bool
 	)
 
 	cmd := &cobra.Command{
@@ -93,20 +183,34 @@ contract's own upgrade entrypoint — "upgrade" by default, or whatever
 function, or that rejects the caller, will fail here with its own error.
 
 The current hash is read from the ledger rather than the database, so an
-upgrade applied outside SoroForge is still reported accurately.`,
+upgrade applied outside SoroForge is still reported accurately.
+
+A WASM without a contractspecv0 section still upgrades, but warns that SoroVault
+cannot catalogue the new interface and clients cannot be generated for it.
+--require-spec turns that warning into an error.
+
+Progress is written to stderr while waiting for confirmation, and only when
+stderr is a terminal, so stdout and --json stay clean. Use --progress to force
+it on in a pipe or log.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			a, err := newApp(cmd.Context(), appOptions{requireSigner: true})
+			a, err := newApp(cmd.Context(), appOptions{
+				requireSigner: true,
+				progress:      progressFor(progress),
+			})
 			if err != nil {
 				return err
 			}
 			defer a.Close()
 
 			result, err := a.service.Upgrade(cmd.Context(), deploy.UpgradeRequest{
-				Alias:   args[0],
-				Network: flags.network,
-				Notes:   notes,
-				DryRun:  dryRun,
+				Alias:       args[0],
+				Network:     flags.network,
+				Notes:       notes,
+				DryRun:      dryRun,
+				GitCommit:   gitCommit,
+				WasmHash:    wasmHash,
+				RequireSpec: requireSpec,
 			})
 			if err != nil {
 				return err
@@ -119,6 +223,13 @@ upgrade applied outside SoroForge is still reported accurately.`,
 		"assemble and simulate without submitting or recording anything")
 	cmd.Flags().StringVar(&notes, "notes", "",
 		"free-form note recorded with this upgrade")
+	cmd.Flags().BoolVar(&progress, "progress", false,
+		"show progress on stderr even when stderr is not a terminal")
+	attachAliasCompletion(cmd)
+	cmd.Flags().StringVar(&gitCommit, "git-commit", "", "override the detected source commit")
+	cmd.Flags().StringVar(&wasmHash, "wasm-hash", "", "upgrade to an existing on-chain WASM hash instead of local file")
+	cmd.Flags().BoolVar(&requireSpec, "require-spec", false,
+		"fail instead of warning when the WASM exports no contractspecv0 section")
 
 	return cmd
 }
@@ -148,7 +259,7 @@ Use --dry-run to assemble and simulate without submitting or recording
 anything.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// A dry run writes nothing, so it does not need Postgres.
+			// A dry run writes nothing, so it does not need a database.
 			a, err := newApp(cmd.Context(), appOptions{
 				requireSigner: true,
 				storeOptional: dryRun,
@@ -175,6 +286,68 @@ anything.`,
 		"assemble and simulate without submitting or recording anything")
 	cmd.Flags().StringVar(&notes, "notes", "",
 		"free-form note recorded with this upload (e.g. a ticket or release tag)")
+	attachAliasCompletion(cmd)
+
+	return cmd
+}
+
+func newInvokeCmd() *cobra.Command {
+	var (
+		dryRun    bool
+		notes     string
+		gitCommit string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "invoke <alias> <fn> [args...]",
+		Short: "Invoke a function on a tracked contract",
+		Long: `Call a function on a tracked contract using the deployer key.
+
+The call is simulated, signed, submitted, and recorded in the deployment history
+with the function name and arguments.
+
+Arguments use the typed syntax:
+  soroforge invoke counter increment
+  soroforge invoke counter add u32:5
+  soroforge invoke token transfer address:GB... u64:1000
+
+Use --dry-run to simulate without submitting or recording anything.`,
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := newApp(cmd.Context(), appOptions{
+				requireSigner: true,
+				storeOptional: dryRun,
+			})
+			if err != nil {
+				return err
+			}
+			defer a.Close()
+
+			alias := args[0]
+			fn := args[1]
+			callArgs := args[2:]
+
+			result, err := a.service.Invoke(cmd.Context(), deploy.InvokeRequest{
+				Alias:     alias,
+				Network:   flags.network,
+				Function:  fn,
+				Args:      callArgs,
+				Notes:     notes,
+				DryRun:    dryRun,
+				GitCommit: gitCommit,
+			})
+			if err != nil {
+				return err
+			}
+			return printInvokeResult(result)
+		},
+	}
+
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false,
+		"assemble and simulate without submitting or recording anything")
+	cmd.Flags().StringVar(&notes, "notes", "",
+		"free-form note recorded with this invocation")
+	cmd.Flags().StringVar(&gitCommit, "git-commit", "", "override the detected source commit")
 
 	return cmd
 }
@@ -204,13 +377,18 @@ Pass --network to restrict the list to one network.`,
 }
 
 func newHistoryCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "history <alias>",
-		Short: "Show a contract's deploy and upgrade history",
+		Short: "Show, export, or import a contract's deploy and upgrade history",
 		Long: `Show every recorded change to one contract on one network, newest first.
 
 Each entry records the WASM hash, who deployed it, the transaction, and the
-ledger it landed in.`,
+ledger it landed in.
+
+The subcommands move the whole history between databases:
+
+  history export  write every contract and deployment as a versioned JSON document
+  history import  load such a document into an empty (or, with --merge, existing) database`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			a, err := newApp(cmd.Context(), appOptions{})
@@ -232,6 +410,161 @@ ledger it landed in.`,
 			return printHistory(alias, network, deployments)
 		},
 	}
+
+	attachAliasCompletion(cmd)
+	cmd.AddCommand(newHistoryExportCmd(), newHistoryImportCmd())
+	return cmd
+}
+
+func newHistoryExportCmd() *cobra.Command {
+	var outPath string
+
+	cmd := &cobra.Command{
+		Use:   "export",
+		Short: "Write the full deployment history as versioned JSON",
+		Long: `Export every tracked contract and every recorded deploy, upgrade, and
+upload to a portable JSON document.
+
+The file is version 1 of a documented format (see internal/store/history.go
+and the README): it carries the original ids and timestamps, so an import
+reproduces the history exactly rather than re-stamping it as "just imported".
+Deployments whose alias has since left soroforge.yaml are still included —
+the history outlives the config.
+
+With --out the document is written to that file; otherwise it goes to stdout,
+where ` + "`soroforge history export > history.json`" + ` does the rest.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			a, err := newApp(cmd.Context(), appOptions{})
+			if err != nil {
+				return err
+			}
+			defer a.Close()
+
+			snap, err := store.BuildSnapshot(cmd.Context(), a.store)
+			if err != nil {
+				return err
+			}
+			data, err := snap.Marshal()
+			if err != nil {
+				return err
+			}
+
+			if outPath == "" {
+				if _, err := out().Write(data); err != nil {
+					return err
+				}
+				return nil
+			}
+			// 0644: the file is history data, not a secret — it holds only
+			// public addresses and hashes by construction.
+			if err := os.WriteFile(outPath, data, 0o644); err != nil {
+				return fmt.Errorf("write history file: %w", err)
+			}
+			fmt.Fprintf(out(), "Exported %d contract(s) and %d deployment(s) to %s.\n",
+				len(snap.Contracts), len(snap.Deployments), outPath)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&outPath, "out", "", "file to write (default: stdout)")
+	return cmd
+}
+
+func newHistoryImportCmd() *cobra.Command {
+	var merge bool
+
+	cmd := &cobra.Command{
+		Use:   "import <file>",
+		Short: "Load a history export into the database",
+		Long: `Import a JSON document written by ` + "`history export`" + `.
+
+Records keep their original ids and timestamps; the importer never re-stamps.
+A database that already holds history is refused unless --merge is given,
+which skips records identical to what is already stored and adds only what is
+missing. Same-id-with-different-content is always an error: when the file and
+the database disagree about an identity, guessing would corrupt one of them.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			raw, err := os.ReadFile(args[0])
+			if err != nil {
+				return fmt.Errorf("read history file: %w", err)
+			}
+			snap, err := store.ParseSnapshot(raw)
+			if err != nil {
+				return err
+			}
+
+			a, err := newApp(cmd.Context(), appOptions{})
+			if err != nil {
+				return err
+			}
+			defer a.Close()
+
+			report, err := store.Import(cmd.Context(), a.store, snap, store.ImportOptions{Merge: merge})
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out(),
+				"Imported %d contract(s) and %d deployment(s) from %s (%d contract(s), %d deployment(s) already present, skipped).\n",
+				report.ContractsImported, report.DeploymentsImported, args[0],
+				report.ContractsSkipped, report.DeploymentsSkipped)
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&merge, "merge", false,
+		"import into a non-empty database, skipping records that exactly duplicate what is stored")
+	return cmd
+}
+
+func newNetworksCmd() *cobra.Command {
+	var timeout time.Duration
+
+	cmd := &cobra.Command{
+		Use:   "networks",
+		Short: "Check every configured network's RPC endpoint",
+		Long: `Probe each network in soroforge.yaml and report whether it answered,
+how fast, its latest ledger, and whether the passphrase the endpoint reports
+matches the one configured.
+
+A mistyped rpc_url or a provider that moved can point "testnet" at a different
+chain; the failure then surfaces as a rejected signature or a deploy on the
+wrong network. This command checks the mapping up front instead. Endpoints are
+probed concurrently, each under --timeout.
+
+The RPC URL is printed with any userinfo and query-string credentials removed,
+so the report is safe to paste into a ticket or a CI log.
+
+Exit codes:
+  0  every network answered and matched its configuration
+  1  at least one check failed (unreachable endpoint or passphrase mismatch)`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := config.Load(flags.configPath)
+			if err != nil {
+				return err
+			}
+
+			// The same client the deploy service uses, so the probe exercises
+			// precisely the endpoint a deploy would.
+			results := netcheck.Check(cmd.Context(), cfg.Networks,
+				netcheck.ClientFactory(deploy.DefaultClientFactory), timeout)
+
+			if err := printNetworkResults(results); err != nil {
+				return err
+			}
+			if netcheck.AnyFailure(results) {
+				cmd.SilenceUsage = true
+				return errors.New("one or more network checks failed")
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().DurationVar(&timeout, "timeout", netcheck.DefaultTimeout,
+		"timeout for each network probe")
+	return cmd
 }
 
 func newStatusCmd() *cobra.Command {
@@ -304,6 +637,7 @@ The non-zero exit on drift makes this usable as a CI gate.`,
 	}
 
 	cmd.Flags().BoolVar(&all, "all", false, "check every tracked contract on the network")
+	attachAliasCompletion(cmd)
 	return cmd
 }
 
@@ -326,8 +660,9 @@ authentication and TLS in front of it.
 Endpoints:
   GET  /health   liveness, no auth
   GET  /ready    readiness (database and each network's RPC), no auth
-  POST /v1/deploy
-  POST /v1/upgrade
+  POST /v1/deploy            (?async=true for a job)
+  POST /v1/upgrade           (?async=true for a job)
+  GET  /v1/jobs/{id}
   GET  /v1/contracts?network=<name>
   GET  /v1/contracts/{network}/{alias}/history
   GET  /v1/contracts/{network}/{alias}/status
@@ -370,7 +705,7 @@ Endpoints:
 				return err
 			}
 
-			return serve(cmd.Context(), api.NewServer(listenAddr, handler))
+			return serve(cmd.Context(), api.NewServer(listenAddr, handler), a.service)
 		},
 	}
 
@@ -382,7 +717,11 @@ Endpoints:
 
 // serve runs the HTTP server until interrupted, then shuts it down gracefully
 // so an in-flight deploy is not cut off mid-submission.
-func serve(ctx context.Context, srv *http.Server) error {
+func serve(ctx context.Context, srv *http.Server, service *deploy.Service) (serveErr error) {
+	defer func() {
+		serveErr = errors.Join(serveErr, service.Close())
+	}()
+
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

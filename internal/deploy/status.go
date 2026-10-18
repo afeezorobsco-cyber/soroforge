@@ -126,7 +126,7 @@ func (s *Service) StatusAll(ctx context.Context, networkName string) (*NetworkSt
 		return result, nil
 	}
 
-	client, err := s.clients(name, network)
+	client, err := s.clientForNetwork(name, network)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", name, err)
 	}
@@ -198,11 +198,45 @@ func (s *Service) List(ctx context.Context, network string) ([]store.Contract, e
 	return s.store.ListContracts(ctx, network)
 }
 
+// ListPage returns one page of tracked contracts without changing CLI behavior.
+func (s *Service) ListPage(ctx context.Context, network string, limit, offset int) ([]store.Contract, error) {
+	if network != "" {
+		name, _, err := s.cfg.Network(network)
+		if err != nil {
+			return nil, err
+		}
+		network = name
+	}
+	return s.store.ListContractsPage(ctx, network, limit, offset)
+}
+
 // History returns a contract's deploy and upgrade log, newest first.
 func (s *Service) History(ctx context.Context, network, alias string) ([]store.Deployment, error) {
+	name, n, err := s.cfg.Network(network)
+	if err != nil {
+		return nil, err
+	}
+	history, err := s.store.History(ctx, name, alias)
+	if err != nil {
+		return nil, err
+	}
+	for i := range history {
+		history[i].ContractURL = n.ContractExplorerURL(history[i].ContractID)
+		history[i].TxURL = n.TransactionExplorerURL(history[i].TxHash)
+	}
+	return history, nil
+}
+
+// GetDeployment returns one deployment record by its ID.
+func (s *Service) GetDeployment(ctx context.Context, id int64) (store.Deployment, error) {
+	return s.store.GetDeployment(ctx, id)
+}
+
+// HistoryPage returns one newest-first page of a contract's deployment log.
+func (s *Service) HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]store.Deployment, error) {
 	name, _, err := s.cfg.Network(network)
 	if err != nil {
 		return nil, err
 	}
-	return s.store.History(ctx, name, alias)
+	return s.store.HistoryPage(ctx, name, alias, limit, offset)
 }

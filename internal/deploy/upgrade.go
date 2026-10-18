@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/soroworks/soroforge/internal/stellar"
 	"github.com/soroworks/soroforge/internal/store"
@@ -12,17 +14,21 @@ import (
 
 // UpgradeRequest asks for a tracked contract's bytecode to be replaced.
 type UpgradeRequest struct {
-	Alias   string `json:"alias"`
-	Network string `json:"network,omitempty"`
-	Notes   string `json:"notes,omitempty"`
-	DryRun  bool   `json:"dry_run,omitempty"`
+	Alias       string `json:"alias"`
+	Network     string `json:"network,omitempty"`
+	Notes       string `json:"notes,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	GitCommit   string `json:"git_commit,omitempty"`
+	WasmHash    string `json:"wasm_hash,omitempty"`
+	RequireSpec bool   `json:"require_spec,omitempty"`
 }
 
 // UpgradeResult describes a completed or simulated upgrade.
 type UpgradeResult struct {
-	Alias      string `json:"alias"`
-	Network    string `json:"network"`
-	ContractID string `json:"contract_id"`
+	Alias       string `json:"alias"`
+	Network     string `json:"network"`
+	ContractID  string `json:"contract_id"`
+	ContractURL string `json:"contract_url,omitempty"`
 
 	// PreviousWasmHash and WasmHash are the version transition this upgrade
 	// performs. Recording both is what makes the history answer "what changed".
@@ -36,14 +42,24 @@ type UpgradeResult struct {
 
 	UploadTxHash  string `json:"upload_tx_hash,omitempty"`
 	UpgradeTxHash string `json:"upgrade_tx_hash,omitempty"`
+	UploadTxURL   string `json:"upload_tx_url,omitempty"`
+	UpgradeTxURL  string `json:"upgrade_tx_url,omitempty"`
 	Ledger        uint32 `json:"ledger,omitempty"`
 
 	DryRun bool `json:"dry_run"`
+
+	// EstimatedFees is what a dry run estimates each transaction would cost.
+	// Nil unless DryRun is set.
+	EstimatedFees *DryRunFees `json:"estimated_fees,omitempty"`
 
 	UploadEnvelopeXDR  string `json:"upload_envelope_xdr,omitempty"`
 	UpgradeEnvelopeXDR string `json:"upgrade_envelope_xdr,omitempty"`
 
 	UploadSkipped bool `json:"upload_skipped,omitempty"`
+
+	// Warnings lists non-fatal problems found in the local artifact. It is empty
+	// for a clean upgrade, and populated in --json output too.
+	Warnings []string `json:"warnings,omitempty"`
 
 	// NoChange reports that the new bytecode is identical to what is already
 	// live, so no upgrade was performed.
@@ -55,6 +71,53 @@ type UpgradeResult struct {
 	// network's sorovault_url. Absent on a dry run, on a no-change upgrade,
 	// or when no registry is configured.
 	Catalog *CatalogStatus `json:"catalog,omitempty"`
+
+	// Webhooks reports the outcome of delivering notifications to configured
+	// webhook endpoints. Absent on a dry run, on a no-change upgrade, or when
+	// no webhooks are configured.
+	Webhooks []WebhookStatus `json:"webhooks,omitempty"`
+}
+
+func (s *Service) resolveUpgradeHash(ctx context.Context, r resolved, input string) (xdr.Hash, string, error) {
+	input = strings.TrimSpace(strings.ToLower(input))
+	if len(input) == 64 {
+		h, err := stellar.ParseHashHex(input)
+		if err != nil {
+			return h, "", err
+		}
+		return h, input, nil
+	}
+
+	history, err := s.store.History(ctx, r.NetworkName, r.Alias)
+	if err != nil {
+		return xdr.Hash{}, "", fmt.Errorf("lookup history for %s/%s: %w", r.NetworkName, r.Alias, err)
+	}
+
+	seen := make(map[string]struct{})
+	var matches []string
+	for _, d := range history {
+		h := strings.ToLower(d.WasmHash)
+		if strings.HasPrefix(h, input) {
+			if _, ok := seen[h]; !ok {
+				seen[h] = struct{}{}
+				matches = append(matches, h)
+			}
+		}
+	}
+
+	if len(matches) == 0 {
+		return xdr.Hash{}, "", fmt.Errorf("no wasm hash starting with %q found in history for %s on %s", input, r.Alias, r.NetworkName)
+	}
+	if len(matches) > 1 {
+		return xdr.Hash{}, "", fmt.Errorf("ambiguous wasm hash prefix %q for %s on %s (matches: %s)", input, r.Alias, r.NetworkName, strings.Join(matches, ", "))
+	}
+
+	target := matches[0]
+	h, err := stellar.ParseHashHex(target)
+	if err != nil {
+		return h, "", err
+	}
+	return h, target, nil
 }
 
 // Upgrade replaces a tracked contract's bytecode, keeping its address.
@@ -92,12 +155,40 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		return nil, err
 	}
 
-	wasm, err := s.readWasm(r.Contract)
-	if err != nil {
-		return nil, err
+	var (
+		wasmHash    xdr.Hash
+		wasmHashHex string
+		wasm        []byte
+		warnings    []string
+	)
+
+	if req.WasmHash != "" {
+		targetHash, targetHex, err := s.resolveUpgradeHash(ctx, r, req.WasmHash)
+		if err != nil {
+			return nil, err
+		}
+		wasmHash = targetHash
+		wasmHashHex = targetHex
+
+		uploaded, err := stellar.WasmUploaded(ctx, r.Client, wasmHash)
+		if err != nil {
+			return nil, fmt.Errorf("check whether wasm hash is on-chain: %w", err)
+		}
+		if !uploaded {
+			return nil, fmt.Errorf("wasm hash %s does not exist on-chain on %s", wasmHashHex, r.NetworkName)
+		}
+	} else {
+		wasm, err = s.readWasm(r.Contract)
+		if err != nil {
+			return nil, err
+		}
+		warnings, err = s.checkWasm(wasm, req.RequireSpec)
+		if err != nil {
+			return nil, err
+		}
+		wasmHash = stellar.WasmHash(wasm)
+		wasmHashHex = stellar.HashHex(wasmHash)
 	}
-	wasmHash := stellar.WasmHash(wasm)
-	wasmHashHex := stellar.HashHex(wasmHash)
 
 	upgradeFunc := r.Contract.UpgradeFuncOrDefault()
 
@@ -113,11 +204,13 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		Alias:            r.Alias,
 		Network:          r.NetworkName,
 		ContractID:       tracked.ContractID,
+		ContractURL:      r.Network.ContractExplorerURL(tracked.ContractID),
 		PreviousWasmHash: tracked.CurrentWasmHash,
 		WasmHash:         wasmHashHex,
 		Deployer:         signer.Address(),
 		UpgradeFunc:      upgradeFunc,
 		DryRun:           req.DryRun,
+		Warnings:         warnings,
 	}
 
 	// Compare against the ledger rather than the database. If someone upgraded
@@ -135,16 +228,24 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		return result, nil
 	}
 
+	fees := &DryRunFees{}
+
 	// Step 1: make the new bytecode available on-chain.
-	upload, skipped, err := s.uploadBytecode(ctx, r, signer, wasm, req.DryRun, log)
-	if err != nil {
-		return nil, err
-	}
-	if skipped {
+	if req.WasmHash != "" {
 		result.UploadSkipped = true
 	} else {
-		result.UploadTxHash = upload.Hash
-		result.UploadEnvelopeXDR = upload.EnvelopeXDR
+		upload, skipped, err := s.uploadBytecode(ctx, r, signer, wasm, req.DryRun, log)
+		if err != nil {
+			return nil, err
+		}
+		if skipped {
+			result.UploadSkipped = true
+		} else {
+			result.UploadTxHash = upload.Hash
+			result.UploadTxURL = r.Network.TransactionExplorerURL(upload.Hash)
+			result.UploadEnvelopeXDR = upload.EnvelopeXDR
+			fees.Upload = &upload.Fee
+		}
 	}
 
 	// Step 2: ask the contract to upgrade itself.
@@ -165,23 +266,54 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		return nil, err
 	}
 
-	upgrade, err := s.runTransaction(ctx, r, invokeOp, req.DryRun)
+	upgrade, err := s.runTransaction(ctx, r, invokeOp, "upgrade", req.DryRun)
 	if err != nil {
 		return nil, fmt.Errorf("invoke %s on %s: %w", upgradeFunc, tracked.ContractID, err)
 	}
 	result.UpgradeTxHash = upgrade.Hash
+	result.UpgradeTxURL = r.Network.TransactionExplorerURL(upgrade.Hash)
 	result.UpgradeEnvelopeXDR = upgrade.EnvelopeXDR
 	result.Ledger = upgrade.Ledger
+	fees.Upgrade = &upgrade.Fee
+	fees.Total = fees.sum()
 
 	if req.DryRun {
+		result.EstimatedFees = fees
 		log.Info("dry run complete, nothing submitted or recorded")
 		return result, nil
+	}
+
+	// The upgrade transaction succeeding only proves the entrypoint ran. A
+	// buggy contract, or a custom upgrade_fn that does something other than
+	// update_current_contract_wasm, can return success without changing the
+	// bytecode. Recording that would create an upgrade that never happened,
+	// and `status` would later report drift with no explanation. The ledger is
+	// the authority on whether the code actually changed.
+	liveAfter, err := s.awaitWasmHash(ctx, r.Client, tracked.ContractID, wasmHash)
+	if err != nil {
+		return nil, fmt.Errorf("verify upgrade of %s on %s: %w",
+			r.Alias, r.NetworkName, err)
+	}
+	if liveAfter != wasmHash {
+		// Nothing is recorded: the provenance rule for this project is that a
+		// history entry exists only when the change is confirmed on-chain.
+		// This transaction confirmed but changed nothing, so there is no
+		// deployment to record. The error identifies the transaction so the
+		// failure is still auditable.
+		return nil, fmt.Errorf(
+			"upgrade of %s on %s: transaction %s confirmed in ledger %d, but the contract is "+
+				"still running wasm %s, not %s; the %q entrypoint returned success without "+
+				"updating the contract's code, so nothing was recorded",
+			r.Alias, r.NetworkName, upgrade.Hash, upgrade.Ledger,
+			stellar.HashHex(liveAfter), wasmHashHex, upgradeFunc)
 	}
 
 	log.Info("contract upgraded",
 		"from_wasm_hash", result.PreviousWasmHash,
 		"to_wasm_hash", wasmHashHex,
 		"tx_hash", upgrade.Hash)
+
+	gitCommit, dirty := gitMetadata(s.cfg.Dir(), req.GitCommit)
 
 	deployment, err := s.record(ctx, store.Deployment{
 		Alias:          r.Alias,
@@ -193,12 +325,71 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		TxHash:         upgrade.Hash,
 		Ledger:         upgrade.Ledger,
 		Notes:          req.Notes,
+		GitCommit:      gitCommit,
+		Dirty:          dirty,
+		FeeCharged:     upgrade.FeeCharged,
+		CIRunURL:       ciRunURL(),
 	})
 	if err != nil {
 		return nil, err
 	}
 	result.Deployment = deployment
 	result.Catalog = s.publish(ctx, r, tracked.ContractID, log)
+	result.Webhooks = s.notifyWebhooks(ctx, r.Network, WebhookPayload{
+		Alias:          r.Alias,
+		Network:        r.NetworkName,
+		ContractID:     tracked.ContractID,
+		Contract:       tracked.ContractID,
+		WasmHash:       wasmHashHex,
+		Action:         store.ActionUpgrade,
+		DeployerPubkey: signer.Address(),
+		TxHash:         upgrade.Hash,
+		Tx:             upgrade.Hash,
+		Ledger:         upgrade.Ledger,
+		Notes:          req.Notes,
+	}, log)
 
 	return result, nil
+}
+
+// awaitWasmHash re-reads a contract's on-chain WASM hash until it reports want
+// or the bounded retry budget is exhausted.
+//
+// The retry exists because the change made by a just-confirmed transaction can
+// take one ledger close to become visible to the RPC node serving the read.
+// Retrying forever would hang on a contract whose upgrade function is a no-op,
+// so the budget is small and fixed. A stale read is not an error: the returned
+// hash simply still differs from want, and the caller explains that.
+func (s *Service) awaitWasmHash(
+	ctx context.Context, client stellar.Client, contractID string, want xdr.Hash,
+) (xdr.Hash, error) {
+	var (
+		last    xdr.Hash
+		lastErr error
+	)
+	for attempt := 1; attempt <= s.verifyAttempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return last, ctx.Err()
+			case <-time.After(s.verifyDelay):
+			}
+		}
+		hash, err := stellar.OnChainWasmHash(ctx, client, contractID)
+		if err != nil {
+			// A transient RPC error is worth retrying too; the last error is
+			// reported if no read ever succeeds.
+			lastErr = err
+			continue
+		}
+		lastErr = nil
+		last = hash
+		if hash == want {
+			return hash, nil
+		}
+	}
+	if lastErr != nil {
+		return last, lastErr
+	}
+	return last, nil
 }

@@ -126,6 +126,25 @@ func (m *MemoryStore) ListContracts(ctx context.Context, network string) ([]Cont
 	return out, nil
 }
 
+// ListContractsPage implements Store.
+func (m *MemoryStore) ListContractsPage(ctx context.Context, network string, limit, offset int) ([]Contract, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	contracts, err := m.ListContracts(ctx, network)
+	if err != nil {
+		return nil, err
+	}
+	if offset >= len(contracts) {
+		return []Contract{}, nil
+	}
+	end := len(contracts)
+	if limit < len(contracts)-offset {
+		end = offset + limit
+	}
+	return contracts[offset:end], nil
+}
+
 // RecordDeployment implements Store.
 func (m *MemoryStore) RecordDeployment(ctx context.Context, d Deployment) (Deployment, error) {
 	if err := ctx.Err(); err != nil {
@@ -141,6 +160,12 @@ func (m *MemoryStore) RecordDeployment(ctx context.Context, d Deployment) (Deplo
 	d.ID = m.nextID
 	m.nextID++
 	d.CreatedAt = m.now()
+
+	if d.FeeCharged != nil {
+		fee := *d.FeeCharged
+		d.FeeCharged = &fee
+	}
+
 	m.deployments = append(m.deployments, d)
 	return d, nil
 }
@@ -171,5 +196,86 @@ func (m *MemoryStore) History(ctx context.Context, network, alias string) ([]Dep
 	return out, nil
 }
 
+// ListAllDeployments implements Store. Returned in id order, matching the
+// Postgres and SQLite ORDER BY, so exports are byte-identical across backends.
+func (m *MemoryStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]Deployment, len(m.deployments))
+	copy(out, m.deployments)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// importSnapshot implements snapshotImporter: inserts records verbatim,
+// preserving the ids and timestamps an import carries rather than re-stamping
+// them, and advances the id counter past everything imported so subsequent
+// RecordDeployment calls cannot collide.
+func (m *MemoryStore) importSnapshot(ctx context.Context, contracts []Contract, deployments []Deployment) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	next := m.nextID
+	for _, c := range contracts {
+		m.contracts[contractKey(c.Network, c.Alias)] = c
+		if c.ID >= next {
+			next = c.ID + 1
+		}
+	}
+	for _, d := range deployments {
+		m.deployments = append(m.deployments, d)
+		if d.ID >= next {
+			next = d.ID + 1
+		}
+	}
+	m.nextID = next
+	return nil
+}
+
+// HistoryPage implements Store.
+func (m *MemoryStore) HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]Deployment, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	history, err := m.History(ctx, network, alias)
+	if err != nil {
+		return nil, err
+	}
+	if offset >= len(history) {
+		return []Deployment{}, nil
+	}
+	end := len(history)
+	if limit < len(history)-offset {
+		end = offset + limit
+	}
+	return history[offset:end], nil
+}
+
 // Close implements Store. There is nothing to release.
 func (m *MemoryStore) Close() error { return nil }
+
+// GetDeployment implements Store.
+func (m *MemoryStore) GetDeployment(ctx context.Context, id int64) (Deployment, error) {
+	if err := ctx.Err(); err != nil {
+		return Deployment{}, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, d := range m.deployments {
+		if d.ID == id {
+			return d, nil
+		}
+	}
+	return Deployment{}, fmt.Errorf("deployment %d: %w", id, ErrNotFound)
+}

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -69,6 +70,10 @@ type Network struct {
 	// RPCURL is the Stellar RPC endpoint, e.g. https://soroban-testnet.stellar.org.
 	RPCURL string `yaml:"rpc_url"`
 
+	// ExplorerURL is the optional base URL of a block explorer for this
+	// network, e.g. https://stellar.expert/explorer/testnet.
+	ExplorerURL string `yaml:"explorer_url"`
+
 	// Passphrase is the network passphrase, e.g. "Test SDF Network ; September 2015".
 	Passphrase string `yaml:"passphrase"`
 
@@ -76,6 +81,53 @@ type Network struct {
 	// Every confirmed deploy and upgrade is registered there, so the
 	// contract's interface is discoverable as soon as it is live. Optional.
 	SoroVaultURL string `yaml:"sorovault_url"`
+
+	// Webhooks lists endpoints notified after each confirmed deploy or upgrade.
+	// Optional.
+	Webhooks []Webhook `yaml:"webhooks"`
+}
+
+// Webhook configures a notification target for confirmed contract events.
+type Webhook struct {
+	URL    string `yaml:"url"`
+	Secret string `yaml:"secret"`
+}
+
+// UnmarshalYAML supports both a bare URL string and an object with url and secret.
+func (w *Webhook) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		w.URL = node.Value
+		return nil
+	}
+	if node.Kind == yaml.MappingNode {
+		type rawWebhook Webhook
+		var raw rawWebhook
+		if err := node.Decode(&raw); err != nil {
+			return err
+		}
+		*w = Webhook(raw)
+		return nil
+	}
+	return fmt.Errorf("webhook: expected a URL string or {url, secret} mapping")
+}
+
+// ContractExplorerURL returns the explorer page for contractID, or an empty
+// string when no explorer is configured.
+func (n Network) ContractExplorerURL(contractID string) string {
+	return explorerURL(n.ExplorerURL, "contract", contractID)
+}
+
+// TransactionExplorerURL returns the explorer page for hash, or an empty
+// string when no explorer is configured.
+func (n Network) TransactionExplorerURL(hash string) string {
+	return explorerURL(n.ExplorerURL, "tx", hash)
+}
+
+func explorerURL(base, kind, value string) string {
+	if base == "" || value == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s/%s", strings.TrimRight(base, "/"), kind, value)
 }
 
 // Contract is a contract SoroForge manages.
@@ -85,8 +137,16 @@ type Contract struct {
 	Wasm string `yaml:"wasm"`
 
 	// ConstructorArgs are passed to the contract's constructor at
-	// instantiation. Empty is valid and common.
+	// instantiation. Empty is valid and common. A network override may
+	// replace them for one network.
 	ConstructorArgs []Arg `yaml:"constructor_args"`
+
+	// InitFunc is the contract entrypoint invoked immediately after
+	// instantiation to initialize contracts that lack constructors.
+	InitFunc string `yaml:"init_fn"`
+
+	// InitArgs are passed to the initializer entrypoint named by InitFunc.
+	InitArgs []Arg `yaml:"init_args"`
 
 	// UpgradeFunc overrides the contract function invoked by `soroforge
 	// upgrade`. Defaults to DefaultUpgradeFunc.
@@ -94,8 +154,53 @@ type Contract struct {
 
 	// Salt is an optional 32-byte hex value that makes the derived contract ID
 	// deterministic. When empty a random salt is generated per deploy, so
-	// deploying the same alias twice yields two distinct contracts.
+	// deploying the same alias twice yields two distinct contracts. A network
+	// override may replace it for one network.
 	Salt string `yaml:"salt"`
+
+	// Networks holds per-network overrides for settings that legitimately
+	// differ between environments — a different admin address in the
+	// constructor, a different token name, or a different salt. Keys must name
+	// networks declared in Networks. An override takes precedence over the
+	// contract's defaults; see ForNetwork for the resolution order.
+	Networks map[string]ContractOverride `yaml:"networks"`
+}
+
+// ContractOverride customises a contract for one network.
+//
+// Only the settings that realistically differ per environment are overridable.
+// `wasm` is not: the same build is deployed everywhere, and `upgrade_fn` is a
+// property of the contract, not of the network it runs on.
+type ContractOverride struct {
+	// ConstructorArgs replaces the contract's constructor_args when deploying
+	// to this network. An explicit empty list is a real override: it deploys
+	// with no constructor arguments, clearing the contract's defaults.
+	ConstructorArgs []Arg `yaml:"constructor_args"`
+
+	// Salt replaces the contract's salt when deploying to this network. An
+	// empty salt means "inherit the contract's salt", since a random salt is
+	// already the default and there is nothing to clear.
+	Salt string `yaml:"salt"`
+}
+
+// ForNetwork returns the contract with the named network's overrides applied
+// on top of the contract's defaults.
+//
+// This is the single resolution point for per-network settings. Deploy, dry
+// run, and any preview call it through Service.resolve, so they cannot
+// disagree about which arguments or salt apply.
+func (c Contract) ForNetwork(network string) Contract {
+	override, ok := c.Networks[network]
+	if !ok {
+		return c
+	}
+	if override.ConstructorArgs != nil {
+		c.ConstructorArgs = override.ConstructorArgs
+	}
+	if override.Salt != "" {
+		c.Salt = override.Salt
+	}
+	return c
 }
 
 // UpgradeFuncOrDefault returns the configured upgrade entrypoint, falling back

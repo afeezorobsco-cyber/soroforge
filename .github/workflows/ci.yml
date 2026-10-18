@@ -163,6 +163,9 @@ jobs:
             scripts/coverage.sh coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Lint OpenAPI document
+        run: npx --yes @redocly/cli lint --extends minimal internal/api/openapi.json
+
   docker:
     runs-on: ubuntu-latest
     permissions:
